@@ -759,7 +759,18 @@ export const exportAttachedFilesSchema = z.object({
     .string()
     .optional()
     .describe("Пояснение, которое сохранится рядом со ссылкой: контрагент, договор, интерес"),
+  archive: z
+    .boolean()
+    .optional()
+    .describe(
+      "Сложить всё в один архив и вернуть одну ссылку. По умолчанию архив собирается " +
+      "сам, когда файлов больше десяти: полсотни ссылок в ответе не переслать и не скачать.",
+    ),
+  archive_name: z.string().optional().describe("Имя архива, например «Договоры Нутриция»"),
 });
+
+/** От скольких файлов собираем архив, если не сказано иначе. */
+const ARCHIVE_FROM = 10;
 
 /** Байты файла — из тома или из базы, смотря где он лежит. */
 async function fileBytes(
@@ -834,7 +845,52 @@ export async function handleExportAttachedFiles(
   }
 
   const ok = results.filter((r) => r.url).length;
+  const wantArchive = params.archive ?? ok > ARCHIVE_FROM;
+
+  if (wantArchive && ok > 1) {
+    const tokens = results
+      .map((r) => (typeof r.url === "string" ? r.url.split("/").pop() : null))
+      .filter((t): t is string => Boolean(t));
+
+    try {
+      const res = await fetch(UPLOAD_URL.replace(/\/+$/, "") + "/archive", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Export-Token": token },
+        body: JSON.stringify({
+          tokens,
+          name: params.archive_name ?? "",
+          note: params.note ?? "",
+        }),
+      });
+      const text = await res.text();
+      if (res.ok) {
+        const body = JSON.parse(text) as Record<string, unknown>;
+        return JSON.stringify({
+          archive: true,
+          total: results.length,
+          uploaded: ok,
+          failed: results.length - ok,
+          url: body.url ?? null,
+          name: body.name ?? null,
+          size: body.size ?? null,
+          files_in_archive: body.files_in_archive ?? null,
+          expires_at: body.expires_at ?? null,
+          hint: "Ссылка живёт час. Отдавать пользователю целиком, вместе с https://.",
+          // Что не попало в архив — показываем отдельно, иначе пользователь
+          // решит, что выгрузилось всё.
+          skipped: results.filter((r) => r.error),
+        });
+      }
+      // Архив не собрался — отдаём отдельные ссылки, они уже рабочие.
+      // Молчать тут нельзя: иначе непонятно, почему ссылок много.
+      results.push({ archive_error: `Архив собрать не удалось (${res.status}): ${text.slice(0, 200)}` });
+    } catch (e) {
+      results.push({ archive_error: e instanceof Error ? e.message : String(e) });
+    }
+  }
+
   return JSON.stringify({
+    archive: false,
     total: results.length,
     uploaded: ok,
     failed: results.length - ok,
