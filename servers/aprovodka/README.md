@@ -11,7 +11,7 @@
 
 > MCP server for **1C:Enterprise** REST API via OData 3.0 — catalogs, documents, registers,
 > accounting, constants, reports, batch ops & change-tracking + metadata discovery.
-> 34 tools across 11 modules. HTTP Basic auth. Stdio + Streamable HTTP transports.
+> 37 tools across 12 modules. HTTP Basic auth. Stdio + Streamable HTTP transports.
 
 [![npm](https://img.shields.io/npm/v/@theyahia/aprovodka)](https://www.npmjs.com/package/@theyahia/aprovodka)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -44,7 +44,7 @@ Tool names, arguments, return formats, and the `ONEC_*` env vars are unchanged.
 
 ---
 
-## Tools (34)
+## Tools (37)
 
 > Tools are grouped into modules. All are registered by default; the `ONEC_SERVICES`
 > env var filters which optional modules load (discovery `meta` is always on). See
@@ -144,6 +144,20 @@ Tool names, arguments, return formats, and the `ONEC_*` env vars are unchanged.
 |------|-------------|
 | `poll_changes_since` | Pull rows modified since a timestamp cursor (`$filter` on a date field); returns a `next_cursor` for the next poll. |
 | `list_subscriptions` | Explicit no-op documenting the absence of 1C webhooks; redirects to `poll_changes_since`. |
+
+### Attached files — `files`
+
+> Bytes go to `Catalog_ХранилищеДвоичныхДанных` and are linked to the file card through
+> `InformationRegister_ХранилищеФайлов` (`ТипХраненияФайла = ВИнформационнойБазе`).
+> Writing into a disk volume (`ВТомахНаДиске`) is not possible over OData — the server's
+> file system is out of reach. Text extraction is left to 1C (`СтатусИзвлеченияТекста =
+> НеИзвлечен`); files already uploaded are moved to volumes by the standard 1C job.
+
+| Tool | Description |
+|------|-------------|
+| `attach_file` | Attach a file to a document or catalog item (`content_base64` or `source_url`). Identical content is deduplicated by SHA-256 hash, the way the database does it itself. |
+| `list_attached_files` | List files attached to an owner, with size, extension and storage type. |
+| `get_attached_file` | Download one attached file's bytes (only for `ВИнформационнойБазе`). |
 
 > **Note on write/posting tools.** `post_document`/`unpost_document`/`delete_document`,
 > `get_accumulation_balance` (virtual `Balance`) and `write_information_register` follow the
@@ -246,13 +260,14 @@ Includes session management (`mcp-session-id` header), CORS, graceful shutdown.
 | `ONEC_APPROVAL_TTL_SEC` | no | Lifetime of a pending approval, seconds (default `300`). |
 | `ONEC_AUDIT_LOG` | no | Path to a JSONL audit ledger for every gated write. Fail-closed: if it cannot be written, the write is refused. |
 | `ONEC_AUDIT_ACTOR` | no | Actor name recorded in the ledger (defaults to `ONEC_LOGIN`). |
+| `ONEC_FILES_AUTHOR_REF` | no | `Ref_Key` of the user recorded as the author of files created by `attach_file`. Without it the file card has no author and looks like nobody's. |
 | `HTTP_PORT` | no | If set, server runs in HTTP mode on this port. |
 
 **Backward-compat:** `1C_BASE_URL`, `1C_LOGIN`, `1C_PASSWORD` are also accepted as fallback.
 
 ### Module filtering (`ONEC_SERVICES`)
 
-Limit registered tools to save LLM context. Modules: `catalogs`, `documents`, `registers`, `accounting`, `constants`, `shortcuts`, `reports`, `odata`, `batch`, `changes` (plus always-on `meta`).
+Limit registered tools to save LLM context. Modules: `catalogs`, `documents`, `registers`, `accounting`, `constants`, `shortcuts`, `reports`, `odata`, `batch`, `changes`, `files` (plus always-on `meta`).
 
 ```bash
 ONEC_SERVICES=catalogs,documents npx @theyahia/aprovodka

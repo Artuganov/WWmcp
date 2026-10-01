@@ -25,6 +25,7 @@ const TOOL_NAMES = new Set([
   "get_recent_documents",
   "batch_create_documents", "batch_update_catalog_items", "batch_query",
   "poll_changes_since", "list_subscriptions",
+  "attach_file", "list_attached_files", "get_attached_file",
 ]);
 
 const PREFIX_BY_KIND: Record<string, string> = {

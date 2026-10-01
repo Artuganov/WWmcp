@@ -88,9 +88,9 @@ describe("write-safety", () => {
 
   it("safety tools are not counted while the gate is off", () => {
     delete process.env["ONEC_SERVICES"];
-    expect(countRegisteredTools(getEnabledModules())).toBe(34);
+    expect(countRegisteredTools(getEnabledModules())).toBe(37);
     process.env["ONEC_WRITE_MODE"] = "approval";
-    expect(countRegisteredTools(getEnabledModules())).toBe(36);
+    expect(countRegisteredTools(getEnabledModules())).toBe(39);
   });
 
   // ── preview mode ──

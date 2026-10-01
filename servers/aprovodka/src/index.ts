@@ -3,7 +3,7 @@
 /**
  * @theyahia/aprovodka — MCP server for 1C:Enterprise REST/OData API
  *
- * 34 tools across 11 modules: meta (always on), catalogs, documents, registers,
+ * 37 tools across 12 modules: meta (always on), catalogs, documents, registers,
  * accounting, constants, shortcuts, batch, changes, reports, odata. Use
  * ONEC_SERVICES env var to limit which optional modules register.
  *

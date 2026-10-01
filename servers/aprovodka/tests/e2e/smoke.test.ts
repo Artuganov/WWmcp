@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 import { runSmokeTest } from "@theyahia/mcp-core/testing/smoke.js";
 
 const SERVER_PATH = resolve(import.meta.dirname, "../../dist/index.js");
-const TOOL_COUNT = 34;
+const TOOL_COUNT = 37;
 
 // Подставные значения — сервер только поднимается, наружу не ходит.
 const ENV = {
@@ -16,6 +16,7 @@ const ENV = {
 };
 
 const TOOL_NAMES = [
+  "attach_file",
   "batch_create_documents",
   "batch_query",
   "batch_update_catalog_items",
@@ -28,6 +29,7 @@ const TOOL_NAMES = [
   "get_accounting_balance",
   "get_accounting_register",
   "get_accumulation_balance",
+  "get_attached_file",
   "get_by_key",
   "get_catalogs",
   "get_config_preset",
@@ -39,6 +41,7 @@ const TOOL_NAMES = [
   "get_recent_documents",
   "get_register",
   "get_report",
+  "list_attached_files",
   "list_entities",
   "list_subscriptions",
   "odata_query",
@@ -53,7 +56,7 @@ const TOOL_NAMES = [
 ];
 
 describe("Aprovodka MCP E2E Smoke Test", () => {
-  it("starts and lists 34 tools", async () => {
+  it("starts and lists 37 tools", async () => {
     const result = await runSmokeTest({
       serverPath: SERVER_PATH,
       expectedToolCount: TOOL_COUNT,

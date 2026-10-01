@@ -35,7 +35,7 @@ describe("getEnabledModules", () => {
   it("default (no env var) enables all modules", () => {
     delete process.env["ONEC_SERVICES"];
     const modules = getEnabledModules();
-    expect(modules.size).toBe(11);
+    expect(modules.size).toBe(12);
     expect(modules.has("meta")).toBe(true);
     expect(modules.has("catalogs")).toBe(true);
     expect(modules.has("odata")).toBe(true);
@@ -45,7 +45,7 @@ describe("getEnabledModules", () => {
 
   it('explicit "all" enables all modules', () => {
     process.env["ONEC_SERVICES"] = "all";
-    expect(getEnabledModules().size).toBe(11);
+    expect(getEnabledModules().size).toBe(12);
   });
 
   it("partial filter enables meta + listed modules only", () => {
@@ -79,9 +79,9 @@ describe("countRegisteredTools", () => {
     process.env = { ...originalEnv };
   });
 
-  it("default config = 34 tools (5 meta + 29 optional)", () => {
+  it("default config = 37 tools (5 meta + 32 optional)", () => {
     delete process.env["ONEC_SERVICES"];
-    expect(countRegisteredTools(getEnabledModules())).toBe(34);
+    expect(countRegisteredTools(getEnabledModules())).toBe(37);
   });
 
   it("ONEC_SERVICES=catalogs = 8 tools (5 meta + 3 catalog)", () => {
@@ -166,13 +166,14 @@ describe("ONEC_WRITE_MODE=deny", () => {
     "create_document", "update_document", "post_document", "unpost_document", "delete_document",
     "write_information_register", "set_constant", "set_deletion_mark",
     "batch_create_documents", "batch_update_catalog_items",
+    "attach_file",
   ];
 
-  it("registers exactly 22 tools and none of them writes", async () => {
+  it("registers exactly 24 tools and none of them writes", async () => {
     delete process.env["ONEC_SERVICES"];
     process.env["ONEC_WRITE_MODE"] = "deny";
     const names = await listRegisteredTools();
-    expect(names.length).toBe(22);
+    expect(names.length).toBe(24);
     for (const w of WRITE_TOOLS) expect(names).not.toContain(w);
     // approve_write/rollback_write тоже не нужны — одобрять нечего.
     expect(names).not.toContain("approve_write");
@@ -199,7 +200,7 @@ describe("ONEC_WRITE_MODE=deny", () => {
       process.env["ONEC_WRITE_MODE"] = mode;
       const names = await listRegisteredTools();
       for (const w of WRITE_TOOLS) expect(names, mode).toContain(w);
-      expect(names.length, mode).toBe(mode === "off" ? 34 : 36);
+      expect(names.length, mode).toBe(mode === "off" ? 37 : 39);
       expect(names.length, mode).toBe(countRegisteredTools(getEnabledModules()));
     }
   });

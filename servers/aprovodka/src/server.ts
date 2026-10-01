@@ -16,6 +16,11 @@ import {
   updateCatalogItemSchema, handleUpdateCatalogItem,
 } from "./tools/catalogs.js";
 import {
+  attachFileSchema, handleAttachFile,
+  listAttachedFilesSchema, handleListAttachedFiles,
+  getAttachedFileSchema, handleGetAttachedFile,
+} from "./tools/files.js";
+import {
   getDocumentsSchema, handleGetDocuments,
   createDocumentSchema, handleCreateDocument,
   updateDocumentSchema, handleUpdateDocument,
@@ -130,6 +135,7 @@ export const MODULE_TOOL_COUNTS = {
   shortcuts: 5,   // find_by_description + get_by_key + count_entities + set_deletion_mark + get_recent_documents
   batch: 3,       // batch_create_documents + batch_update_catalog_items + batch_query
   changes: 2,     // poll_changes_since + list_subscriptions
+  files: 3,       // attach_file + list_attached_files + get_attached_file
 } as const;
 
 /**
@@ -143,12 +149,13 @@ export const MODULE_WRITE_TOOL_COUNTS: Partial<Record<keyof typeof MODULE_TOOL_C
   constants: 1,  // set_constant
   shortcuts: 1,  // set_deletion_mark
   batch: 2,      // batch_create_documents + batch_update_catalog_items
+  files: 1,      // attach_file
 };
 
 export type ModuleName = keyof typeof MODULE_TOOL_COUNTS;
 const OPTIONAL_MODULES: ModuleName[] = [
   "catalogs", "documents", "registers", "reports", "odata",
-  "constants", "accounting", "shortcuts", "batch", "changes",
+  "constants", "accounting", "shortcuts", "batch", "changes", "files",
 ];
 
 /**
@@ -572,6 +579,42 @@ export function createServer(): McpServer {
       listSubscriptionsSchema.shape,
       withErrorHandling(async (params) => ({
         content: [{ type: "text", text: await handleListSubscriptions(params) }],
+      })),
+    );
+  }
+
+  if (modules.has("files")) {
+    writeTool(
+      "attach_file",
+      "Прикрепить файл к объекту 1С (счёт к заказу поставщику, оффер к интересу и т.п.). " +
+      "Файл передаётся содержимым в base64 ИЛИ ссылкой source_url — по ссылке сервер скачает " +
+      "сам, и для больших файлов это единственный разумный путь: base64 в аргументах упирается " +
+      "в лимит контекста. Данные кладутся в информационную базу; текст файла не извлекается и " +
+      "в том на диске файл не переносится — это штатная работа 1С.",
+      attachFileSchema.shape,
+      withErrorHandling(async (params) => ({
+        content: [{ type: "text", text: await handleAttachFile(params) }],
+      })),
+    );
+
+    server.tool(
+      "list_attached_files",
+      "Список присоединённых файлов объекта 1С по его Ref_Key. Содержимое не возвращает — " +
+      "только карточки (имя, расширение, размер, дата, способ хранения).",
+      listAttachedFilesSchema.shape,
+      withErrorHandling(async (params) => ({
+        content: [{ type: "text", text: await handleListAttachedFiles(params) }],
+      })),
+    );
+
+    server.tool(
+      "get_attached_file",
+      "Скачать присоединённый файл: карточка плюс содержимое в base64. Файлы, лежащие в томе " +
+      "на диске сервера 1С, через OData недоступны — для них возвращается пояснение, а не пустое " +
+      "содержимое.",
+      getAttachedFileSchema.shape,
+      withErrorHandling(async (params) => ({
+        content: [{ type: "text", text: await handleGetAttachedFile(params) }],
       })),
     );
   }
