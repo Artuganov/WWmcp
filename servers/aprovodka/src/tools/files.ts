@@ -486,6 +486,17 @@ export const findAttachedFilesSchema = z.object({
   extension: z.string().optional().describe("Расширение без точки: pdf, docx"),
   top_per_catalog: z.number().int().min(1).max(1000).default(200)
     .describe("Сколько файлов брать максимум из одного каталога"),
+  resolve_owner: z
+    .boolean()
+    .default(false)
+    .describe(
+      "Дочитать владельца каждого файла и вытащить из него контрагента, партнёра и " +
+      "представление. Нужно, чтобы разложить выгрузку по контрагентам: в карточке файла " +
+      "есть только ссылка на документ. Стоит по запросу на каждого уникального владельца.",
+    ),
+  counterparty_ref: refKeySchema
+    .optional()
+    .describe("Оставить только файлы, чей владелец привязан к этому контрагенту. Включает resolve_owner."),
 });
 
 /** «2026-07-01» → «2026-07-01T00:00:00»; с временем — как есть. */
@@ -518,7 +529,7 @@ export async function handleFindAttachedFiles(
   // не поддерживать отбор. Такой каталог пропускаем с пометкой, но не роняем
   // весь поиск: из-за одного отсутствующего владельца ответ стал бы пустым.
   const perCatalog = await Promise.all(
-    ownerTypes.map(async (ownerType) => {
+    ownerTypes.map(async (ownerType): Promise<{ ownerType: string; error?: string; files: Array<Record<string, unknown>> }> => {
       let filesCatalog: string;
       try {
         filesCatalog = filesCatalogFor(ownerType);
@@ -530,7 +541,8 @@ export async function handleFindAttachedFiles(
           buildODataPath(filesCatalog, {
             $filter: filter,
             $select:
-              "Ref_Key,Description,Расширение,Размер,ДатаСоздания,ТипХраненияФайла,ВладелецФайла_Key",
+              "Ref_Key,Description,Расширение,Размер,ДатаСоздания,ТипХраненияФайла," +
+              "ВладелецФайла_Key,ПутьКФайлу,Том_Key",
             $orderby: "ДатаСоздания desc",
             $top: String(params.top_per_catalog),
             $format: "json",
@@ -544,22 +556,173 @@ export async function handleFindAttachedFiles(
     }),
   );
 
-  const files = perCatalog.flatMap((r) => r.files);
+  let files = perCatalog.flatMap((r) => r.files);
   const skipped = perCatalog
     .filter((r) => r.error)
     .map((r) => ({ owner_type: r.ownerType, error: r.error }));
 
+  // Путь файла в томе. Отдаём его всегда, когда можем: вытащить сотню файлов
+  // через base64 в ответе инструмента нереально — «все файлы за квартал» это
+  // десятки мегабайт, которые пришлось бы прогнать через контекст модели.
+  // Зная путь, байты забирают с диска напрямую там, где том смонтирован.
+  const volumePaths = await volumePathIndex(files);
+  files = files.map((f) => {
+    const vol = typeof f.Том_Key === "string" ? volumePaths.get(f.Том_Key) : undefined;
+    const rel = typeof f.ПутьКФайлу === "string" ? f.ПутьКФайлу.replace(/\\/g, "/") : "";
+    return vol && rel
+      ? { ...f, volume_path: vol.replace(/\/+$/, "") + "/" + rel.replace(/^\/+/, "") }
+      : f;
+  });
+
+  // Разрешение владельца до контрагента. В карточке файла его нет — только
+  // ссылка на документ, поэтому документ приходится дочитывать.
+  const needOwners = params.resolve_owner || Boolean(params.counterparty_ref);
+  if (needOwners) {
+    const owners = await resolveOwners(files);
+    files = files.map((f) => {
+      const key = `${f.owner_type}|${f.ВладелецФайла_Key}`;
+      const o = owners.get(key);
+      return o ? { ...f, owner: o } : f;
+    });
+    if (params.counterparty_ref) {
+      const want = params.counterparty_ref.toLowerCase();
+      files = files.filter(
+        (f) =>
+          (f.owner as { counterparty_key?: string } | undefined)?.counterparty_key?.toLowerCase() === want,
+      );
+    }
+  }
+
   // Сводка по типам владельцев — чтобы было видно, где файлы вообще лежат,
   // не пролистывая весь список.
   const byOwnerType: Record<string, number> = {};
-  for (const r of perCatalog) if (r.files.length) byOwnerType[r.ownerType] = r.files.length;
+  for (const f of files) {
+    const t = String(f.owner_type);
+    byOwnerType[t] = (byOwnerType[t] ?? 0) + 1;
+  }
+
+  // Разбивка по контрагентам — то, ради чего обычно и зовут resolve_owner.
+  let byCounterparty: Record<string, number> | undefined;
+  if (needOwners) {
+    byCounterparty = {};
+    for (const f of files) {
+      const o = f.owner as { counterparty_name?: string } | undefined;
+      const name = o?.counterparty_name || "(контрагент не определён)";
+      byCounterparty[name] = (byCounterparty[name] ?? 0) + 1;
+    }
+  }
 
   return JSON.stringify({
     total: files.length,
     by_owner_type: byOwnerType,
+    by_counterparty: byCounterparty,
     scanned_owner_types: ownerTypes.length,
     skipped: skipped.length ? skipped : undefined,
     filter,
     files,
   });
+}
+
+/**
+ * Пути томов по их ссылкам — одним запросом на весь результат поиска.
+ *
+ * По строке на файл это был бы запрос на каждый файл ради одного и того же
+ * пути: том в базе обычно один.
+ */
+async function volumePathIndex(
+  files: Array<Record<string, unknown>>,
+): Promise<Map<string, string>> {
+  const index = new Map<string, string>();
+  const keys = [...new Set(files.map((f) => f.Том_Key).filter((k): k is string => typeof k === "string" && !/^0{8}-/.test(k)))];
+  if (keys.length === 0) return index;
+
+  const res = (await oneCGet(
+    buildODataPath("Catalog_ТомаХраненияФайлов", {
+      $select: "Ref_Key,ПолныйПутьLinux",
+      $format: "json",
+    }),
+  ).catch(() => null)) as { value?: Array<{ Ref_Key?: string; ПолныйПутьLinux?: string }> } | null;
+
+  for (const v of res?.value ?? []) {
+    if (v.Ref_Key && v.ПолныйПутьLinux) index.set(v.Ref_Key, v.ПолныйПутьLinux);
+  }
+  return index;
+}
+
+/**
+ * Владельцы файлов: представление документа и привязка к контрагенту.
+ *
+ * Поле с контрагентом у разных типов владельцев называется по-разному, а у
+ * части (например, у самого партнёра) его нет вовсе — он и есть владелец.
+ * Поэтому не угадываем по типу, а читаем запись целиком и смотрим, какие из
+ * известных полей в ней есть. Дороже по трафику, зато работает на любом типе,
+ * включая те, что появятся позже.
+ *
+ * Запрос идёт на каждого уникального владельца, а не на каждый файл: к одному
+ * договору обычно подшито несколько файлов.
+ */
+async function resolveOwners(
+  files: Array<Record<string, unknown>>,
+): Promise<Map<string, Record<string, unknown>>> {
+  const resolved = new Map<string, Record<string, unknown>>();
+
+  const unique = new Map<string, { ownerType: string; ref: string }>();
+  for (const f of files) {
+    const ownerType = typeof f.owner_type === "string" ? f.owner_type : "";
+    const ref = typeof f.ВладелецФайла_Key === "string" ? f.ВладелецФайла_Key : "";
+    if (!ownerType || !ref || /^0{8}-/.test(ref)) continue;
+    unique.set(`${ownerType}|${ref}`, { ownerType, ref });
+  }
+
+  const counterpartyNames = new Map<string, string>();
+
+  await Promise.all(
+    [...unique.entries()].map(async ([key, { ownerType, ref }]) => {
+      const rec = (await oneCGet(
+        buildKeyedPath(ownerType, ref, undefined, { $format: "json" }),
+      ).catch(() => null)) as Record<string, unknown> | null;
+      if (!rec) return;
+
+      // Контрагент бывает прямым полем, бывает владельцем (у договора —
+      // Владелец), а у самого контрагента его нет: он и есть владелец.
+      const cpKey =
+        (typeof rec.Контрагент_Key === "string" && rec.Контрагент_Key) ||
+        (ownerType === "Catalog_Контрагенты" ? ref : "") ||
+        "";
+      const partnerKey = typeof rec.Партнер_Key === "string" ? rec.Партнер_Key : "";
+
+      resolved.set(key, {
+        owner_type: ownerType,
+        ref_key: ref,
+        presentation: rec.Description ?? rec.Номер ?? null,
+        number: rec.Номер ?? null,
+        date: rec.Date ?? rec.Дата ?? null,
+        counterparty_key: cpKey || null,
+        partner_key: partnerKey || null,
+      });
+      if (cpKey && !/^0{8}-/.test(cpKey)) counterpartyNames.set(cpKey, "");
+    }),
+  );
+
+  // Имена контрагентов — одним запросом на всех, а не по одному на файл.
+  if (counterpartyNames.size) {
+    const res = (await oneCGet(
+      buildODataPath("Catalog_Контрагенты", {
+        $select: "Ref_Key,Description,ИНН",
+        $top: "1000",
+        $format: "json",
+      }),
+    ).catch(() => null)) as { value?: Array<{ Ref_Key?: string; Description?: string; ИНН?: string }> } | null;
+    for (const c of res?.value ?? []) {
+      if (c.Ref_Key && counterpartyNames.has(c.Ref_Key)) counterpartyNames.set(c.Ref_Key, c.Description ?? "");
+    }
+    for (const [, owner] of resolved) {
+      const k = owner.counterparty_key;
+      if (typeof k === "string" && counterpartyNames.has(k)) {
+        owner.counterparty_name = counterpartyNames.get(k) || null;
+      }
+    }
+  }
+
+  return resolved;
 }
