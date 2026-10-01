@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
 import { resolve, sep } from "node:path";
 import { z } from "zod";
-import { oneCGet, oneCPost, buildODataPath, buildKeyedPath } from "../client.js";
+import { oneCGet, oneCPost, buildODataPath, buildKeyedPath, escapeODataString } from "../client.js";
 import { refKeySchema } from "../validation.js";
 
 /**
@@ -427,5 +427,139 @@ export async function handleGetAttachedFile(
     ...card,
     hash: blob?.Хеш ?? null,
     content_base64: blob?.ДвоичныеДанные_Base64Data ?? null,
+  });
+}
+
+// ──────────────────────────────────────────────────────────────
+// find_attached_files
+// ──────────────────────────────────────────────────────────────
+
+/**
+ * Поиск файлов сразу по многим типам владельцев.
+ *
+ * Зачем отдельный инструмент. Единой таблицы «все присоединённые файлы» в 1С
+ * нет: у каждого типа владельца свой справочник `<Владелец>ПрисоединенныеФайлы`,
+ * в этой базе их около полутора сотен. Поэтому «все файлы по контрагенту» или
+ * «все файлы за квартал» одним запросом не берутся — надо обойти каталоги.
+ *
+ * На диске это тем более не решается: том разложен по датам загрузки
+ * (`20250411/имя.pdf`) и о контрагентах ничего не знает. Связь «файл → объект»
+ * живёт только в карточке (ВладелецФайла_Key), то есть в базе.
+ *
+ * По умолчанию обходим не все каталоги, а коммерческий набор — те владельцы,
+ * что реально привязаны к контрагенту. Полный обход полутора сотен каталогов
+ * ради пары файлов стоит полторы сотни запросов; кому нужно — передаёт
+ * owner_types явно.
+ */
+const COMMERCIAL_OWNER_TYPES = [
+  "Catalog_ДоговорыКонтрагентов",
+  "Catalog_Партнеры",
+  "Catalog_СоглашенияСКлиентами",
+  "Catalog_СоглашенияСПоставщиками",
+  "Document_ЗаказКлиента",
+  "Document_ЗаказПоставщику",
+  "Document_РеализацияТоваровУслуг",
+  "Document_ПриобретениеТоваровУслуг",
+  "Document_СчетНаОплатуКлиенту",
+  "Document_КоммерческоеПредложениеКлиенту",
+  "Document_CRM_Интерес",
+  "Document_АктВыполненныхРабот",
+];
+
+export const findAttachedFilesSchema = z.object({
+  owner_types: z
+    .array(z.string())
+    .optional()
+    .describe(
+      "Типы владельцев для обхода. По умолчанию коммерческий набор: договоры, " +
+      "партнёры, соглашения, заказы, реализации, приобретения, счета, КП, интересы, акты.",
+    ),
+  owner_ref: refKeySchema
+    .optional()
+    .describe("Ref_Key конкретного владельца — вернуть файлы только его"),
+  created_from: z
+    .string()
+    .optional()
+    .describe("Дата создания файла от, YYYY-MM-DD или YYYY-MM-DDTHH:MM:SS"),
+  created_to: z.string().optional().describe("Дата создания файла до, включительно по датам"),
+  name_contains: z.string().optional().describe("Подстрока в имени файла"),
+  extension: z.string().optional().describe("Расширение без точки: pdf, docx"),
+  top_per_catalog: z.number().int().min(1).max(1000).default(200)
+    .describe("Сколько файлов брать максимум из одного каталога"),
+});
+
+/** «2026-07-01» → «2026-07-01T00:00:00»; с временем — как есть. */
+function asODataDateTime(value: string, endOfDay = false): string {
+  const v = value.trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(v)) return `${v}T${endOfDay ? "23:59:59" : "00:00:00"}`;
+  return v;
+}
+
+export async function handleFindAttachedFiles(
+  params: z.infer<typeof findAttachedFilesSchema>,
+): Promise<string> {
+  const ownerTypes = params.owner_types?.length ? params.owner_types : COMMERCIAL_OWNER_TYPES;
+
+  const conditions: string[] = [];
+  if (params.owner_ref) conditions.push(`ВладелецФайла_Key eq guid'${params.owner_ref}'`);
+  if (params.created_from)
+    conditions.push(`ДатаСоздания ge datetime'${asODataDateTime(params.created_from)}'`);
+  if (params.created_to)
+    conditions.push(`ДатаСоздания le datetime'${asODataDateTime(params.created_to, true)}'`);
+  if (params.extension)
+    conditions.push(`Расширение eq '${escapeODataString(params.extension.replace(/^\./, ""))}'`);
+  if (params.name_contains)
+    conditions.push(`substringof('${escapeODataString(params.name_contains)}',Description)`);
+  // Папки внутри каталога файлов — это группы, а не файлы.
+  conditions.push("IsFolder eq false");
+  const filter = conditions.join(" and ");
+
+  // Каталог может не существовать (не у всякого владельца заведены файлы) или
+  // не поддерживать отбор. Такой каталог пропускаем с пометкой, но не роняем
+  // весь поиск: из-за одного отсутствующего владельца ответ стал бы пустым.
+  const perCatalog = await Promise.all(
+    ownerTypes.map(async (ownerType) => {
+      let filesCatalog: string;
+      try {
+        filesCatalog = filesCatalogFor(ownerType);
+      } catch (e) {
+        return { ownerType, error: e instanceof Error ? e.message : String(e), files: [] };
+      }
+      try {
+        const res = (await oneCGet(
+          buildODataPath(filesCatalog, {
+            $filter: filter,
+            $select:
+              "Ref_Key,Description,Расширение,Размер,ДатаСоздания,ТипХраненияФайла,ВладелецФайла_Key",
+            $orderby: "ДатаСоздания desc",
+            $top: String(params.top_per_catalog),
+            $format: "json",
+          }),
+        )) as { value?: Array<Record<string, unknown>> };
+        const files = (res?.value ?? []).map((f) => ({ ...f, owner_type: ownerType, files_catalog: filesCatalog }));
+        return { ownerType, files };
+      } catch (e) {
+        return { ownerType, error: e instanceof Error ? e.message : String(e), files: [] };
+      }
+    }),
+  );
+
+  const files = perCatalog.flatMap((r) => r.files);
+  const skipped = perCatalog
+    .filter((r) => r.error)
+    .map((r) => ({ owner_type: r.ownerType, error: r.error }));
+
+  // Сводка по типам владельцев — чтобы было видно, где файлы вообще лежат,
+  // не пролистывая весь список.
+  const byOwnerType: Record<string, number> = {};
+  for (const r of perCatalog) if (r.files.length) byOwnerType[r.ownerType] = r.files.length;
+
+  return JSON.stringify({
+    total: files.length,
+    by_owner_type: byOwnerType,
+    scanned_owner_types: ownerTypes.length,
+    skipped: skipped.length ? skipped : undefined,
+    filter,
+    files,
   });
 }

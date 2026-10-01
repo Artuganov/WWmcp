@@ -19,6 +19,7 @@ import {
   attachFileSchema, handleAttachFile,
   listAttachedFilesSchema, handleListAttachedFiles,
   getAttachedFileSchema, handleGetAttachedFile,
+  findAttachedFilesSchema, handleFindAttachedFiles,
 } from "./tools/files.js";
 import {
   getDocumentsSchema, handleGetDocuments,
@@ -135,7 +136,7 @@ export const MODULE_TOOL_COUNTS = {
   shortcuts: 5,   // find_by_description + get_by_key + count_entities + set_deletion_mark + get_recent_documents
   batch: 3,       // batch_create_documents + batch_update_catalog_items + batch_query
   changes: 2,     // poll_changes_since + list_subscriptions
-  files: 3,       // attach_file + list_attached_files + get_attached_file
+  files: 4,       // attach_file + list_attached_files + get_attached_file + find_attached_files
 } as const;
 
 /**
@@ -615,6 +616,18 @@ export function createServer(): McpServer {
       getAttachedFileSchema.shape,
       withErrorHandling(async (params) => ({
         content: [{ type: "text", text: await handleGetAttachedFile(params) }],
+      })),
+    );
+
+    server.tool(
+      "find_attached_files",
+      "Найти файлы сразу по многим типам владельцев: отбор по дате создания, владельцу, " +
+      "имени, расширению. Единой таблицы всех присоединённых файлов в 1С нет — у каждого " +
+      "типа владельца свой справочник, поэтому инструмент обходит их пачкой. Содержимое не " +
+      "возвращает, только карточки; за байтами — get_attached_file.",
+      findAttachedFilesSchema.shape,
+      withErrorHandling(async (params) => ({
+        content: [{ type: "text", text: await handleFindAttachedFiles(params) }],
       })),
     );
   }
