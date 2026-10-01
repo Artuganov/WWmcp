@@ -726,3 +726,119 @@ async function resolveOwners(
 
   return resolved;
 }
+
+// ──────────────────────────────────────────────────────────────
+// export_attached_files
+// ──────────────────────────────────────────────────────────────
+
+/**
+ * Выгрузка файлов ссылками.
+ *
+ * Зачем отдельно от get_attached_file. Ответ любого инструмента обрезается на
+ * 50 000 символов (mcp-core/sanitize) — это ~37 КБ исходного файла. Договор на
+ * 3,6 МБ через base64 не пройдёт в принципе, и даже если бы прошёл, он занял
+ * бы ~4,9 МБ контекста модели. Поэтому байты здесь вообще не возвращаются:
+ * файл уезжает на бэкенд, а наружу идёт ссылка со сроком жизни в час.
+ *
+ * Так это работает из любой сессии, у которой есть MCP, — ssh и доступ к
+ * серверам не нужны.
+ *
+ * Требует EXPORT_UPLOAD_TOKEN; без него инструмент честно говорит, что не
+ * настроен, вместо попытки залить файл в никуда.
+ */
+const UPLOAD_URL = process.env["EXPORT_UPLOAD_URL"]?.trim() || "https://parts.mrkt.ru/api/temp-downloads";
+
+export const exportAttachedFilesSchema = z.object({
+  owner_type: ownerTypeSchema,
+  ref_keys: z
+    .array(refKeySchema)
+    .min(1)
+    .max(50)
+    .describe("Ref_Key карточек файлов (из find_attached_files или list_attached_files)"),
+  note: z
+    .string()
+    .optional()
+    .describe("Пояснение, которое сохранится рядом со ссылкой: контрагент, договор, интерес"),
+});
+
+/** Байты файла — из тома или из базы, смотря где он лежит. */
+async function fileBytes(
+  ownerType: string,
+  refKey: string,
+): Promise<{ bytes: Buffer; name: string } | { error: string }> {
+  const raw = await handleGetAttachedFile({ owner_type: ownerType, ref_key: refKey });
+  const card = JSON.parse(raw) as Record<string, unknown>;
+
+  const base = typeof card.Description === "string" ? card.Description : refKey;
+  const ext = typeof card.Расширение === "string" && card.Расширение ? "." + card.Расширение : "";
+  const name = base.endsWith(ext) ? base : base + ext;
+
+  if (typeof card.content_base64 !== "string" || !card.content_base64) {
+    return { error: typeof card.error === "string" ? card.error : "Содержимое файла недоступно" };
+  }
+  return { bytes: Buffer.from(card.content_base64, "base64"), name };
+}
+
+export async function handleExportAttachedFiles(
+  params: z.infer<typeof exportAttachedFilesSchema>,
+): Promise<string> {
+  const token = process.env["EXPORT_UPLOAD_TOKEN"]?.trim();
+  if (!token) {
+    return JSON.stringify({
+      error:
+        "Выгрузка ссылками не настроена: нет EXPORT_UPLOAD_TOKEN. " +
+        "Задайте его в окружении сервера, он должен совпадать с TEMP_DOWNLOAD_TOKEN на бэкенде.",
+    });
+  }
+
+  const results: Array<Record<string, unknown>> = [];
+
+  // Последовательно, а не пачкой: файлы тяжёлые, и десяток параллельных
+  // загрузок по несколько мегабайт — это лишняя нагрузка и на том, и на бэкенд.
+  for (const refKey of params.ref_keys) {
+    const got = await fileBytes(params.owner_type, refKey);
+    if ("error" in got) {
+      results.push({ ref_key: refKey, error: got.error });
+      continue;
+    }
+
+    try {
+      const res = await fetch(UPLOAD_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Export-Token": token },
+        body: JSON.stringify({
+          name: got.name,
+          content_base64: got.bytes.toString("base64"),
+          source: "1c",
+          note: params.note ?? "",
+        }),
+      });
+
+      const text = await res.text();
+      if (!res.ok) {
+        results.push({ ref_key: refKey, name: got.name, error: `Бэкенд ответил ${res.status}: ${text.slice(0, 200)}` });
+        continue;
+      }
+
+      const body = JSON.parse(text) as Record<string, unknown>;
+      results.push({
+        ref_key: refKey,
+        name: got.name,
+        size: got.bytes.length,
+        url: body.url ?? null,
+        expires_at: body.expires_at ?? null,
+      });
+    } catch (e) {
+      results.push({ ref_key: refKey, name: got.name, error: e instanceof Error ? e.message : String(e) });
+    }
+  }
+
+  const ok = results.filter((r) => r.url).length;
+  return JSON.stringify({
+    total: results.length,
+    uploaded: ok,
+    failed: results.length - ok,
+    hint: "Ссылки живут час. Отдавать пользователю целиком, вместе с https://.",
+    files: results,
+  });
+}

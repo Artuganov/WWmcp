@@ -20,6 +20,7 @@ import {
   listAttachedFilesSchema, handleListAttachedFiles,
   getAttachedFileSchema, handleGetAttachedFile,
   findAttachedFilesSchema, handleFindAttachedFiles,
+  exportAttachedFilesSchema, handleExportAttachedFiles,
 } from "./tools/files.js";
 import {
   getDocumentsSchema, handleGetDocuments,
@@ -136,7 +137,7 @@ export const MODULE_TOOL_COUNTS = {
   shortcuts: 5,   // find_by_description + get_by_key + count_entities + set_deletion_mark + get_recent_documents
   batch: 3,       // batch_create_documents + batch_update_catalog_items + batch_query
   changes: 2,     // poll_changes_since + list_subscriptions
-  files: 4,       // attach_file + list_attached_files + get_attached_file + find_attached_files
+  files: 5,       // attach_file + list/get/find_attached_files + export_attached_files
 } as const;
 
 /**
@@ -628,6 +629,18 @@ export function createServer(): McpServer {
       findAttachedFilesSchema.shape,
       withErrorHandling(async (params) => ({
         content: [{ type: "text", text: await handleFindAttachedFiles(params) }],
+      })),
+    );
+
+    server.tool(
+      "export_attached_files",
+      "Выгрузить файлы ссылками: кладёт их на бэкенд и возвращает ссылки со сроком жизни в час. " +
+      "Для всего, что тяжелее пары десятков килобайт, использовать именно этот инструмент, а не " +
+      "get_attached_file: ответ любого инструмента обрезается на 50 000 символов, то есть ~37 КБ " +
+      "исходного файла, и base64 всё равно занял бы контекст модели.",
+      exportAttachedFilesSchema.shape,
+      withErrorHandling(async (params) => ({
+        content: [{ type: "text", text: await handleExportAttachedFiles(params) }],
       })),
     );
   }
