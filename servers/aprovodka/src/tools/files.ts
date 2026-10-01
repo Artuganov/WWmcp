@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { readFile, stat } from "node:fs/promises";
+import { resolve, sep } from "node:path";
 import { z } from "zod";
 import { oneCGet, oneCPost, buildODataPath, buildKeyedPath } from "../client.js";
 import { refKeySchema } from "../validation.js";
@@ -12,8 +14,10 @@ import { refKeySchema } from "../validation.js";
  * ссылка на документ. Сами байты хранятся одним из двух способов:
  *
  *  • «ВТомахНаДиске» — на диске тома, в карточке лежит только ПутьКФайлу.
- *    Так хранится большинство файлов этой базы. Через OData записать туда
- *    нельзя: у нас нет доступа к файловой системе сервера 1С.
+ *    Так хранится большинство файлов этой базы. Через OData туда нельзя ни
+ *    записать, ни прочитать: байтов в карточке нет вовсе. Читать их всё же
+ *    можно, если том смонтирован к нам, — см. ONEC_FILE_VOLUMES ниже. Запись
+ *    в том по-прежнему только средствами 1С.
  *
  *  • «ВИнформационнойБазе» — байты в Catalog_ХранилищеДвоичныхДанных, связь
  *    с карточкой через InformationRegister_ХранилищеФайлов. Это доступно по
@@ -40,6 +44,57 @@ const DEFAULT_AUTHOR = process.env.ONEC_FILES_AUTHOR_REF?.trim() || "";
 
 /** Предел на размер: base64 раздувает данные на треть, а ответ OData целиком в памяти. */
 const MAX_BYTES = 25 * 1024 * 1024;
+
+/**
+ * Тома файлов, смонтированные локально, — чтобы отдавать и те файлы, что
+ * лежат не в базе, а на диске сервера 1С.
+ *
+ * Формат ONEC_FILE_VOLUMES: «путь_в_1С=путь_у_нас», через запятую. Путь в 1С
+ * берётся из Catalog_ТомаХраненияФайлов.ПолныйПутьLinux как есть. Пример:
+ *
+ *   ONEC_FILE_VOLUMES=/mnt/1c-files/=/mnt/1c-files
+ *
+ * Если переменная не задана, поведение прежнее: по файлу из тома инструмент
+ * честно отвечает, что содержимое недоступно. Это намеренно — сервер без
+ * смонтированного тома не должен делать вид, что умеет больше, чем умеет.
+ */
+function volumeMounts(): Array<{ remote: string; local: string }> {
+  const raw = process.env["ONEC_FILE_VOLUMES"]?.trim();
+  if (!raw) return [];
+  return raw
+    .split(",")
+    .map((pair) => pair.trim())
+    .filter(Boolean)
+    .map((pair) => {
+      const eq = pair.indexOf("=");
+      if (eq < 1) throw new Error(`ONEC_FILE_VOLUMES: не понял «${pair}», нужно «путь_в_1С=путь_у_нас»`);
+      return {
+        remote: pair.slice(0, eq).trim().replace(/[/\\]+$/, ""),
+        local: pair.slice(eq + 1).trim().replace(/[/\\]+$/, ""),
+      };
+    });
+}
+
+/**
+ * Полный путь к файлу тома у нас на диске — или null, если том не смонтирован.
+ *
+ * Отдельно стережём выход за корень тома: ПутьКФайлу приходит из базы, а не
+ * от пользователя, но «..» в нём превратили бы инструмент в чтение любого
+ * файла на машине. Сравниваем уже после resolve, иначе «/mnt/1c-files-прочее»
+ * прошло бы проверку на префикс.
+ */
+function resolveVolumePath(volumeRemoteRoot: string, relativePath: string): string | null {
+  const wanted = volumeRemoteRoot.replace(/[/\\]+$/, "");
+  const mount = volumeMounts().find((m) => m.remote === wanted);
+  if (!mount) return null;
+
+  const root = resolve(mount.local);
+  const full = resolve(root, relativePath.replace(/\\/g, "/").replace(/^\/+/, ""));
+  if (full !== root && !full.startsWith(root + sep)) {
+    throw new Error(`Путь к файлу выводит за пределы тома: «${relativePath}»`);
+  }
+  return full;
+}
 
 const ownerTypeSchema = z
   .string()
@@ -242,6 +297,87 @@ export async function handleListAttachedFiles(
 // get_attached_file
 // ──────────────────────────────────────────────────────────────
 
+/**
+ * Отдаёт файл, лежащий в томе на диске сервера 1С.
+ *
+ * Том в карточке указан ссылкой, его путь живёт в Catalog_ТомаХраненияФайлов.
+ * Берём путь оттуда, а не из переменной окружения в одиночку: томов может
+ * быть несколько, и сопоставление «том из базы → наш каталог» должно быть
+ * явным, иначе файл второго тома молча прочитался бы из первого.
+ */
+async function readFromVolume(card: Record<string, unknown>): Promise<string> {
+  const unavailable = (error: string) => JSON.stringify({ ...card, content_base64: null, error });
+
+  if (volumeMounts().length === 0) {
+    return unavailable(
+      "Файл хранится в томе на диске сервера 1С, а тома не смонтированы. " +
+      "Чтобы читать такие файлы, смонтируйте том и укажите ONEC_FILE_VOLUMES.",
+    );
+  }
+
+  const volumeKey = typeof card.Том_Key === "string" ? card.Том_Key : "";
+  const relative = typeof card.ПутьКФайлу === "string" ? card.ПутьКФайлу : "";
+  if (!volumeKey || !relative) {
+    return unavailable("В карточке нет тома или пути к файлу — читать нечего.");
+  }
+
+  const volume = (await oneCGet(
+    buildKeyedPath("Catalog_ТомаХраненияФайлов", volumeKey, undefined, {
+      $select: "Description,ПолныйПутьLinux",
+      $format: "json",
+    }),
+  ).catch(() => null)) as { Description?: string; ПолныйПутьLinux?: string } | null;
+
+  const remoteRoot = volume?.ПолныйПутьLinux?.trim();
+  if (!remoteRoot) {
+    return unavailable(`Не нашёл путь тома ${volumeKey} в Catalog_ТомаХраненияФайлов.`);
+  }
+
+  let full: string | null;
+  try {
+    full = resolveVolumePath(remoteRoot, relative);
+  } catch (e) {
+    return unavailable(e instanceof Error ? e.message : String(e));
+  }
+  if (!full) {
+    return unavailable(
+      `Том «${volume?.Description ?? volumeKey}» (${remoteRoot}) у нас не смонтирован. ` +
+      `Добавьте его в ONEC_FILE_VOLUMES как «${remoteRoot.replace(/\/+$/, "")}=<локальный путь>».`,
+    );
+  }
+
+  // Размер берём с диска, а не из карточки: карточка может врать, если файл
+  // подменили мимо 1С, а в память читаем именно то, что на диске.
+  let size: number;
+  try {
+    size = (await stat(full)).size;
+  } catch {
+    return unavailable(`Файла нет на диске: ${full}. Том смонтирован не тот или файл удалён мимо 1С.`);
+  }
+  if (size > MAX_BYTES) {
+    return unavailable(`Файл ${size} байт — больше предела ${MAX_BYTES}. Заберите его с диска напрямую.`);
+  }
+
+  let bytes: Buffer;
+  try {
+    bytes = await readFile(full);
+  } catch (e) {
+    return unavailable(
+      `Не смог прочитать ${full}: ${e instanceof Error ? e.message : String(e)}. ` +
+      "Обычно это права: том монтируется только на чтение, но под пользователем, которому файлы видны.",
+    );
+  }
+
+  return JSON.stringify({
+    ...card,
+    storage: "volume",
+    volume_name: volume?.Description ?? null,
+    size_on_disk: size,
+    hash: createHash("sha256").update(bytes).digest("base64"),
+    content_base64: bytes.toString("base64"),
+  });
+}
+
 export const getAttachedFileSchema = z.object({
   owner_type: ownerTypeSchema,
   ref_key: refKeySchema.describe("Ref_Key карточки файла"),
@@ -253,20 +389,17 @@ export async function handleGetAttachedFile(
   const filesCatalog = filesCatalogFor(params.owner_type);
   const card = (await oneCGet(
     buildKeyedPath(filesCatalog, params.ref_key, undefined, {
-      $select: "Ref_Key,Description,Расширение,Размер,ТипХраненияФайла,ПутьКФайлу",
+      $select: "Ref_Key,Description,Расширение,Размер,ТипХраненияФайла,ПутьКФайлу,Том_Key",
       $format: "json",
     }),
   )) as Record<string, unknown>;
 
-  // Файл в томе на диске сервера 1С — байты по OData недоступны в принципе.
-  // Говорим это прямо, а не возвращаем пустое содержимое: пустой ответ
+  // Файл в томе на диске сервера 1С. По OData байты недоступны в принципе,
+  // поэтому читаем их с диска — если том смонтирован к нам (ONEC_FILE_VOLUMES).
+  // Без монтирования отвечаем прямо, что содержимое недоступно: пустой ответ
   // выглядел бы как «файл пустой».
   if (card?.ТипХраненияФайла === "ВТомахНаДиске") {
-    return JSON.stringify({
-      ...card,
-      content_base64: null,
-      error: "Файл хранится в томе на диске сервера 1С — через OData содержимое недоступно.",
-    });
+    return await readFromVolume(card);
   }
 
   const link = (await oneCGet(
