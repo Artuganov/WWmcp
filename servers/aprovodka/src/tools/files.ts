@@ -157,7 +157,60 @@ export const attachFileSchema = z.object({
   author_ref_key: refKeySchema.optional().describe(
     "Ref_Key пользователя-автора. По умолчанию берётся из ONEC_FILES_AUTHOR_REF.",
   ),
+  folder: z.string().optional().describe(
+    "Имя папки в карточке файлов владельца, например «Черновик». Папка должна уже существовать.",
+  ),
+  folder_ref_key: refKeySchema.optional().describe(
+    "Ref_Key папки — когда известен точно; тогда folder не нужен.",
+  ),
 });
+
+/**
+ * Найти папку в карточке присоединённых файлов владельца.
+ *
+ * Папки — элементы того же справочника с IsFolder = true, и у каждой свой
+ * ВладелецФайла. Поэтому ищем по владельцу И по имени: «Черновик» у одного
+ * договора и «Черновик» у другого — разные папки, и подставить чужую нельзя.
+ */
+async function resolveFileFolder(
+  filesCatalog: string,
+  ownerRefKey: string,
+  name: string,
+): Promise<string> {
+  const escaped = name.replace(/'/g, "''");
+  const res = (await oneCGet(
+    buildODataPath(filesCatalog, {
+      $filter: `IsFolder eq true and ВладелецФайла_Key eq guid'${ownerRefKey}' and Description eq '${escaped}'`,
+      $select: "Ref_Key,Description",
+      $top: "2",
+      $format: "json",
+    }),
+  )) as { value?: Array<{ Ref_Key?: string }> };
+
+  const found = res?.value ?? [];
+  if (found.length === 1 && found[0].Ref_Key) return found[0].Ref_Key;
+  if (found.length > 1) {
+    throw new Error(`У этого владельца несколько папок «${name}» — передайте folder_ref_key`);
+  }
+
+  // Не нашли — перечислим, что есть. Иначе человек гадает, как папка названа
+  // на самом деле, и пробует варианты вслепую.
+  const all = (await oneCGet(
+    buildODataPath(filesCatalog, {
+      $filter: `IsFolder eq true and ВладелецФайла_Key eq guid'${ownerRefKey}'`,
+      $select: "Description",
+      $top: "50",
+      $format: "json",
+    }),
+  )) as { value?: Array<{ Description?: string }> };
+  const names = (all?.value ?? []).map((f) => f.Description).filter(Boolean);
+  throw new Error(
+    `Папка «${name}» у этого владельца не найдена.` +
+      (names.length
+        ? ` Есть такие: ${names.join(", ")}.`
+        : " Папок у него нет вообще — создайте её в 1С."),
+  );
+}
 
 export async function handleAttachFile(params: z.infer<typeof attachFileSchema>): Promise<string> {
   if (!params.content_base64 && !params.source_url) {
@@ -235,6 +288,14 @@ export async function handleAttachFile(params: z.infer<typeof attachFileSchema>)
     card.Изменил_Key = author;
   }
 
+  // Папка. Без неё файл ляжет в корень карточки, и его придётся переносить
+  // руками — отдельным запросом, которого у вызывающего может и не быть.
+  let folderKey: string | null = params.folder_ref_key ?? null;
+  if (!folderKey && params.folder) {
+    folderKey = await resolveFileFolder(filesCatalog, params.owner_ref_key, params.folder);
+  }
+  if (folderKey) card.Parent_Key = folderKey;
+
   const file = (await oneCPost(
     buildODataPath(filesCatalog, { $format: "json" }),
     card,
@@ -260,6 +321,7 @@ export async function handleAttachFile(params: z.infer<typeof attachFileSchema>)
     storage_ref_key: storageKey,
     storage_reused: reused,
     storage_type: "ВИнформационнойБазе",
+    folder_ref_key: folderKey,
     note: "Текст файла не извлечён и в том не перенесён — это делает 1С штатными средствами.",
   });
 }
