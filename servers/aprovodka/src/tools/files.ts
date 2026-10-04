@@ -546,6 +546,11 @@ export const findAttachedFilesSchema = z.object({
   created_to: z.string().optional().describe("Дата создания файла до, включительно по датам"),
   name_contains: z.string().optional().describe("Подстрока в имени файла"),
   extension: z.string().optional().describe("Расширение без точки: pdf, docx"),
+  compact: z.boolean().optional().describe(
+    "Компактная выдача: короткие ключи и владельцы отдельной картой, без повтора " +
+    "блока владельца в каждом файле. Нужна тому, кто читает сотни файлов разом: " +
+    "обычный ответ упирается в предел 50 000 символов и приезжает обрезанным.",
+  ),
   top_per_catalog: z.number().int().min(1).max(1000).default(200)
     .describe("Сколько файлов брать максимум из одного каталога"),
   resolve_owner: z
@@ -672,6 +677,41 @@ export async function handleFindAttachedFiles(
       const name = o?.counterparty_name || "(контрагент не определён)";
       byCounterparty[name] = (byCounterparty[name] ?? 0) + 1;
     }
+  }
+
+  // Компактная выдача. Обычная повторяет блок владельца в каждом файле, и на
+  // сотне файлов ответ упирается в предел инструмента (50 000 символов) —
+  // JSON приезжает обрезанным, и вызывающему приходится дробить запрос на
+  // десятки частей. Здесь владельцы вынесены в отдельную карту, а ключи
+  // укорочены: та же выдача занимает втрое меньше.
+  if (params.compact) {
+    const owners: Record<string, { p?: unknown; num?: unknown; dt?: unknown; cp?: unknown }> = {};
+    const slim = files.map((f) => {
+      const key = `${f.owner_type}|${f.ВладелецФайла_Key}`;
+      const o = f.owner as Record<string, unknown> | undefined;
+      if (o && !owners[key]) {
+        owners[key] = { p: o.presentation, num: o.number, dt: o.date, cp: o.counterparty_name };
+      }
+      return {
+        k: f.Ref_Key,
+        n: f.Description,
+        e: f.Расширение,
+        s: f.Размер,
+        d: f.ДатаСоздания,
+        t: f.owner_type,
+        o: f.ВладелецФайла_Key,
+      };
+    });
+
+    return JSON.stringify({
+      total: files.length,
+      by_owner_type: byOwnerType,
+      scanned_owner_types: ownerTypes.length,
+      skipped: skipped.length ? skipped : undefined,
+      compact: true,
+      owners,
+      files: slim,
+    });
   }
 
   return JSON.stringify({
