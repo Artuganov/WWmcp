@@ -1,6 +1,6 @@
 {
   "name": "@theyahia/aprovodka",
-  "version": "4.11.0",
+  "version": "4.11.1",
   "description": "1C:Enterprise (1С:Предприятие) for AI agents: read and post documents, catalog CRUD, accounting and accumulation balances, OData queries (37 tools, Russia)",
   "type": "module",
   "main": "dist/index.js",

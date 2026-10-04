@@ -152,6 +152,63 @@ describe("has_more — признак незавершённой выдачи", 
     expect(parsed).not.toHaveProperty("has_more");
   });
 
+  /**
+   * Обрезка по бюджету — тоже «есть продолжение».
+   *
+   * Так уже терялись данные на живой базе: 1С отдавала тысячу строк регистра,
+   * конверт писал next_skip=1000, а в ответ влезало около двухсот записей.
+   * Тот, кто шёл по страницам, перепрыгивал через восемьсот строк и не узнавал
+   * об этом — у партнёра показалось 321 документ из 1185.
+   */
+  it("обрезка по бюджету пересчитывает next_skip по тому, что реально уехало", async () => {
+    // Записи заведомо толстые: тысяча таких в 45 000 символов не влезает.
+    const fat = Array.from({ length: 1000 }, (_, i) => ({
+      Ref_Key: `r${i}`,
+      Описание: "д".repeat(200),
+    }));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        text: () => Promise.resolve(JSON.stringify({ value: fat })),
+        headers: new Map(),
+      }),
+    );
+
+    const parsed = JSON.parse(
+      await handleODataQuery({ entity: "Catalog_Test", top: 1000, skip: 0, inlinecount: false }),
+    ) as Envelope & { truncated: number };
+
+    expect(parsed.truncated).toBeGreaterThan(0);
+    expect(parsed.returned).toBeLessThan(1000);
+    expect(parsed.has_more).toBe(true);
+    // Главное: следующая страница начинается там, где оборвалась эта.
+    expect(parsed.next_skip).toBe(parsed.returned);
+    expect(parsed.returned + parsed.truncated).toBe(1000);
+  });
+
+  it("обрезка поднимает has_more, даже когда 1С отдала всё", async () => {
+    const fat = Array.from({ length: 400 }, (_, i) => ({
+      Ref_Key: `r${i}`,
+      Описание: "д".repeat(200),
+    }));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        text: () => Promise.resolve(JSON.stringify({ value: fat })),
+        headers: new Map(),
+      }),
+    );
+
+    const parsed = JSON.parse(
+      await handleODataQuery({ entity: "Catalog_Test", top: 1000, skip: 120, inlinecount: false }),
+    ) as Envelope & { truncated: number };
+
+    expect(parsed.has_more).toBe(true);
+    expect(parsed.next_skip).toBe(120 + parsed.returned);
+  });
+
   it("batch_query: конверт есть в данных каждого под-запроса", async () => {
     mockRows(101);
     const parsed = JSON.parse(

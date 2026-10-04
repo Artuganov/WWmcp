@@ -117,8 +117,19 @@ const TRUNCATED_NOTE =
  * `arrayKey` — поле-массив, которое можно укоротить (`value`, `rows`, `results`).
  * Если ответ влезает в бюджет — отдаётся как есть, без лишних полей. Если нет —
  * добавляются `truncated` (сколько записей отброшено) и `note`.
+ *
+ * `repage` вызывается, только когда записи действительно отброшены, и возвращает
+ * поля конверта, которые от этого изменились. Без него конверт лгал: `toPage`
+ * считал `next_skip` по числу записей ДО обрезки, обрезка выкидывала хвост, и
+ * тот, кто шёл по страницам, перепрыгивал через всё отброшенное. Молча: ошибки
+ * нет, данные просто не доезжают. На живой базе так пропало две трети истории
+ * партнёра — страница показала 321 документ из 1185 и выглядела рабочей.
  */
-export function stringifyCapped(payload: unknown, arrayKey: string): string {
+export function stringifyCapped(
+  payload: unknown,
+  arrayKey: string,
+  repage?: (kept: number) => Record<string, unknown>,
+): string {
   const full = JSON.stringify(payload);
   if (full.length <= RESPONSE_BUDGET) return full;
   if (!payload || typeof payload !== "object") return full;
@@ -128,9 +139,14 @@ export function stringifyCapped(payload: unknown, arrayKey: string): string {
   // Не массив — резать по записям нечего; дальше сработает страховка ядра.
   if (!Array.isArray(items)) return full;
 
+  // Поля от repage считаем в бюджет сразу: длина `next_skip` меняется от числа
+  // записей, и подставлять их после подсчёта значило бы вылезти за лимит.
+  const patch = repage ? repage(items.length) : {};
+
   // Сколько записей влезает: один проход с накоплением, без подбора.
   let used = JSON.stringify({
     ...envelope,
+    ...patch,
     [arrayKey]: [],
     truncated: items.length,
     note: TRUNCATED_NOTE,
@@ -145,15 +161,26 @@ export function stringifyCapped(payload: unknown, arrayKey: string): string {
 
   return JSON.stringify({
     ...envelope,
+    ...(repage ? repage(keep) : {}),
     [arrayKey]: items.slice(0, keep),
     truncated: items.length - keep,
     note: TRUNCATED_NOTE,
   });
 }
 
-/** `toPage` + компактная сериализация с обрезкой по записям. */
+/**
+ * `toPage` + компактная сериализация с обрезкой по записям.
+ *
+ * Обрезка — такой же «есть продолжение», как и лишняя запись из `probeTop`:
+ * поэтому при ней `has_more` поднимается, а `next_skip` пересчитывается по тому,
+ * что реально уехало в ответ.
+ */
 export function pageJson(result: unknown, top: number, skip?: number): string {
-  return stringifyCapped(toPage(result, top, skip), "value");
+  return stringifyCapped(toPage(result, top, skip), "value", (kept) => ({
+    returned: kept,
+    has_more: true,
+    ...(skip === undefined ? {} : { next_skip: skip + kept }),
+  }));
 }
 
 /**
